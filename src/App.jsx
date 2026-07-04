@@ -8,239 +8,7 @@ import {
   ArrowRight, Copy, Check, Rocket, RefreshCw, Lock, ChevronRight, Server,
 } from "lucide-react";
 
-/* ============================================================
-   MOCK AGENT LOGIC — pure functions, no UI concerns
-   ============================================================ */
-
-function parseRequirements(raw) {
-  const text = raw.toLowerCase();
-
-  let users = 1000;
-  const userMatch = text.match(/([\d]{1,3}(?:,\d{3})*|\d+(?:\.\d+)?)\s*(k)?\s*(?:daily|monthly)?\s*(?:active\s*)?users?/);
-  if (userMatch) {
-    let n = parseFloat(userMatch[1].replace(/,/g, ""));
-    if (userMatch[2]) n *= 1000;
-    if (!isNaN(n) && n > 0) users = n;
-  }
-
-  let latencyMs = 2000;
-  const subMatch = text.match(/sub[- ]?(\d+(?:\.\d+)?)\s*s\b/);
-  const msMatch = text.match(/(\d+)\s*ms\b/);
-  const sMatch = text.match(/(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b/);
-  if (subMatch) latencyMs = parseFloat(subMatch[1]) * 1000;
-  else if (msMatch) latencyMs = parseFloat(msMatch[1]);
-  else if (sMatch) latencyMs = parseFloat(sMatch[1]) * 1000;
-
-  const flags = {
-    rag: /\brag\b|retrieval/.test(text),
-    chat: /\bchat\b|conversation|support bot|assistant/.test(text),
-    classification: /classif/.test(text),
-    image: /\bimage\b|vision/.test(text),
-    video: /\bvideo\b/.test(text),
-    voice: /\bvoice\b|speech|audio/.test(text),
-  };
-  if (!Object.values(flags).some(Boolean)) flags.chat = true;
-
-  return { raw, users, latencyMs, flags };
-}
-
-function buildReasoningTrace(req) {
-  const lines = [];
-  const secs = req.latencyMs % 1000 === 0 ? (req.latencyMs / 1000).toFixed(0) : (req.latencyMs / 1000).toFixed(1);
-  lines.push(`Reading requirement: ${fmtNum(req.users)} users, ${secs}s latency target`);
-  const flagList = Object.entries(req.flags).filter(([, v]) => v).map(([k]) => k);
-  lines.push(`Classifying workload: ${flagList.join(", ")}`);
-  lines.push(`Sizing concurrency at roughly ${Math.max(5, Math.round(req.users * 0.045))} simultaneous sessions`);
-  if (req.flags.rag) lines.push("Comparing managed vector index options for this scale");
-  if (req.flags.image || req.flags.video || req.flags.voice) lines.push("Checking whether GPU inference is required");
-  lines.push("Modeling monthly token burn — prompt, completion, and third-party API calls");
-  lines.push("Drafting two infrastructure options and comparing trade-offs");
-  return lines;
-}
-
-function estimateStack(req) {
-  const concurrency = Math.max(5, Math.round(req.users * 0.045));
-  const needsGpu = req.flags.image || req.flags.video || req.flags.voice;
-  const needsVectorDb = req.flags.rag;
-  const callsPerUserPerDay = req.flags.classification ? 9 : req.flags.rag ? 4 : req.flags.chat ? 6 : 3;
-  const dailyLlmCalls = Math.max(50, Math.round(req.users * callsPerUserPerDay * 0.35));
-  const dailyApiCalls = Math.max(80, Math.round(req.users * 1.8));
-
-  function tierPlan(tier) {
-    const isPerf = tier === "perf";
-    const computeUnitCost = isPerf ? 64 : 36;
-    const computeCost = Math.round((concurrency * computeUnitCost) / 10) * 10;
-    const vectorDbCost = needsVectorDb ? Math.round((isPerf ? 150 : 65) + concurrency * (isPerf ? 0.55 : 0.3)) : 0;
-    const avgPromptTokens = isPerf ? 1500 : 1000;
-    const avgCompletionTokens = isPerf ? 320 : 230;
-    const promptPrice = isPerf ? 7.5 : 2.0;
-    const completionPrice = isPerf ? 22 : 7.5;
-    const llmCost = Math.round(dailyLlmCalls * 30 * ((avgPromptTokens / 1e6) * promptPrice + (avgCompletionTokens / 1e6) * completionPrice));
-    const apiCost = Math.round(dailyApiCalls * 30 * (isPerf ? 0.0009 : 0.0006));
-    const total = computeCost + vectorDbCost + llmCost + apiCost;
-    const estimatedLatencyMs = Math.round(req.latencyMs * (isPerf ? 0.72 : 1.28) * (needsGpu && !isPerf ? 1.15 : 1));
-    return {
-      key: tier,
-      name: isPerf ? "Latency-optimized" : "Cost-optimized",
-      needsGpu, needsVectorDb,
-      flagsClassification: req.flags.classification,
-      concurrency,
-      estimatedLatencyMs,
-      meetsTarget: estimatedLatencyMs <= req.latencyMs,
-      computeDesc: needsGpu
-        ? `${isPerf ? "Dedicated" : "Shared"} GPU inference pool · ${Math.max(2, Math.round(concurrency / 40))}–${Math.max(4, Math.round(concurrency / 22))} nodes`
-        : `Autoscaling CPU pool · ${Math.max(2, Math.round(concurrency / 60))}–${Math.max(4, Math.round(concurrency / 28))} nodes`,
-      modelDesc: isPerf ? "Frontier-tier reasoning model" : "Efficient-tier instruction model",
-      smallModelDesc: req.flags.classification ? "Compact classifier model for routing/labeling calls" : null,
-      vectorDbDesc: needsVectorDb ? (isPerf ? "Managed vector index · multi-zone" : "Managed vector index · single-zone") : null,
-      costs: { compute: computeCost, vectorDb: vectorDbCost, llm: llmCost, api: apiCost, total },
-      dailyLlmCalls, avgPromptTokens, avgCompletionTokens, dailyApiCalls,
-      tradeoff: isPerf
-        ? "Meets the latency target with margin. The added cost is mostly the model choice, not the infrastructure."
-        : "Runs lean and costs less. Latency can drift above target under peak load — worth watching if p95 matters.",
-    };
-  }
-
-  const cost = tierPlan("cost");
-  const perf = tierPlan("perf");
-  cost.recommended = cost.meetsTarget;
-  perf.recommended = !cost.meetsTarget;
-  return [cost, perf];
-}
-
-function buildHistory(avgDaily, weeklyGrowth, days) {
-  const dailyGrowth = Math.pow(1 + weeklyGrowth, 1 / 7) - 1;
-  let val = avgDaily / Math.pow(1 + dailyGrowth, days - 1);
-  const arr = [];
-  for (let i = 0; i < days; i++) {
-    const noise = 1 + (Math.random() * 0.16 - 0.08);
-    arr.push(Math.max(1, Math.round(val * noise)));
-    val = val * (1 + dailyGrowth);
-  }
-  return arr;
-}
-
-function weeklyGrowthFromHistory(arr) {
-  const n = arr.length;
-  if (n < 14) return 0;
-  const lastWeek = arr.slice(n - 7).reduce((a, b) => a + b, 0);
-  const prevWeek = arr.slice(n - 14, n - 7).reduce((a, b) => a + b, 0);
-  if (prevWeek <= 0) return 0;
-  return (lastWeek - prevWeek) / prevWeek;
-}
-
-function buildBurnChartData(history, budget, cycleLengthDays = 30) {
-  const n = history.length;
-  const cum = [];
-  let running = 0;
-  for (let i = 0; i < n; i++) { running += history[i]; cum.push(running); }
-  const weekly = weeklyGrowthFromHistory(history);
-  const dailyGrowth = Math.pow(1 + Math.max(weekly, -0.5), 1 / 7) - 1;
-  const points = cum.map((c, i) => ({ day: i + 1, actual: c, projected: null }));
-  points[n - 1].projected = points[n - 1].actual;
-  let val = history[n - 1];
-  let runningProj = cum[n - 1];
-  let overrunDay = null;
-  const maxExtra = cycleLengthDays - n + 12;
-  for (let i = 1; i <= maxExtra; i++) {
-    val = val * (1 + dailyGrowth);
-    runningProj += val;
-    points.push({ day: n + i, actual: null, projected: Math.round(runningProj) });
-    if (overrunDay === null && runningProj >= budget) overrunDay = n + i;
-  }
-  const daysUntilOverrun = overrunDay !== null ? overrunDay - n : null;
-  const overrunWithinCycle = overrunDay !== null && overrunDay <= cycleLengthDays;
-  return {
-    points, daysUntilOverrun, overrunWithinCycle, dailyGrowth, weeklyGrowth: weekly,
-    usedSoFar: cum[n - 1], currentDaily: history[n - 1],
-  };
-}
-
-function clamp(v, min, max) { return Math.min(max, Math.max(min, v)); }
-
-function walk(arr, opts = {}) {
-  const { min = 0, max = 100, step = 4, spikeChance = 0 } = opts;
-  const last = arr[arr.length - 1].v;
-  let delta = (Math.random() * 2 - 1) * step;
-  if (spikeChance && Math.random() < spikeChance) delta += step * 4 * (Math.random() > 0.5 ? 1 : -1);
-  const next = clamp(last + delta, min, max);
-  const t = arr[arr.length - 1].t + 1;
-  return [...arr.slice(1), { t, v: Math.round(next * 10) / 10 }];
-}
-
-function seedSeries(base, opts) {
-  let arr = [{ t: 0, v: base }];
-  for (let i = 1; i < 20; i++) arr = walk(arr, opts);
-  return arr;
-}
-
-function avgSeries(arr) { return arr.reduce((a, b) => a + b.v, 0) / arr.length; }
-
-function fmtNum(n) {
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
-  return Math.round(n).toString();
-}
-function fmtMoney(n) { return "$" + Math.round(n).toLocaleString("en-US"); }
-
-function buildRecommendations({ plan, llm, api, liveAvg, promptShare }) {
-  const recs = [];
-  const ratio = promptShare / (1 - promptShare);
-  if (ratio >= 2.2) {
-    const pct = Math.min(35, Math.round((ratio - 1) * 8));
-    recs.push({
-      id: "prompt-compress", category: "llm", title: "Compress your system prompt",
-      detail: `Prompt tokens are running ${ratio.toFixed(1)}x completion tokens. Trimming the system prompt and retrieval context typically recovers ${pct}% of LLM spend without changing output quality.`,
-      impact: `~${fmtMoney((plan.costs.llm * pct) / 100)}/mo`,
-    });
-  }
-  if (llm.overrunWithinCycle) {
-    const weeklyPct = Math.round(llm.weeklyGrowth * 100);
-    recs.push({
-      id: "llm-budget", category: "llm", title: "LLM budget is on track to run out early",
-      detail: `Usage has grown ${weeklyPct}% week-over-week. At this pace the monthly LLM token budget runs out in about ${llm.daysUntilOverrun} day${llm.daysUntilOverrun === 1 ? "" : "s"} — before the cycle ends.`,
-      impact: "Budget risk",
-    });
-  }
-  if (api.overrunWithinCycle) {
-    recs.push({
-      id: "api-budget", category: "api", title: "API token budget is trending over",
-      detail: `At the current burn rate, the API token budget is projected to run out in about ${api.daysUntilOverrun} day${api.daysUntilOverrun === 1 ? "" : "s"}. Caching repeat calls or raising the cap would both help.`,
-      impact: "Budget risk",
-    });
-  }
-  if (plan.needsGpu && liveAvg.gpu < 18) {
-    const savings = Math.round(plan.costs.compute * 0.35);
-    recs.push({
-      id: "gpu-idle", category: "compute", title: "Your GPU pool is mostly idle",
-      detail: `Average GPU utilization is ${liveAvg.gpu.toFixed(0)}% over the monitoring window. Downsizing to a smaller GPU tier would likely cut this line item by about ${fmtMoney(savings)}/mo.`,
-      impact: `~${fmtMoney(savings)}/mo`,
-    });
-  }
-  if (plan.flagsClassification) {
-    const savings = Math.round(plan.costs.llm * 0.18);
-    recs.push({
-      id: "small-model", category: "llm", title: "Route classification calls to a smaller model",
-      detail: "Classification-style calls don't need a frontier model. Routing them to a compact model is projected to save roughly 40% of that slice of LLM spend.",
-      impact: `~${fmtMoney(savings)}/mo`,
-    });
-  }
-  if (liveAvg.error > 2.2) {
-    recs.push({
-      id: "error-rate", category: "reliability", title: "Error rate is above a healthy baseline",
-      detail: `Errors are averaging ${liveAvg.error.toFixed(1)}% over the last few minutes, above the 2% baseline. Check retry and backoff settings on the calls that spiked.`,
-      impact: "Reliability risk",
-    });
-  }
-  if (recs.length === 0) {
-    recs.push({
-      id: "all-good", category: "compute", title: "Everything is within healthy range",
-      detail: "No budget, utilization, or reliability signal needs attention right now.",
-      impact: "—",
-    });
-  }
-  return recs;
-}
+const API_ROOT = (import.meta.env.VITE_API_BASE || "/api").replace(/\/$/, "");
 
 const EXAMPLES = [
   "We're building a RAG pipeline for 10,000 daily users with sub-2s latency",
@@ -249,15 +17,42 @@ const EXAMPLES = [
 ];
 
 const CATEGORY_META = {
-  compute: { label: "Compute", cls: "pill-compute", Icon: Cpu },
-  api: { label: "API tokens", cls: "pill-api", Icon: Zap },
-  llm: { label: "LLM tokens", cls: "pill-llm", Icon: Sparkles },
-  reliability: { label: "Reliability", cls: "pill-reliability", Icon: ShieldAlert },
+  compute: { label: "Compute", cls: "pill-compute", Icon: Cpu, color: "var(--accent-compute)" },
+  api: { label: "API tokens", cls: "pill-api", Icon: Zap, color: "var(--accent-api)" },
+  llm: { label: "LLM tokens", cls: "pill-llm", Icon: Sparkles, color: "var(--accent-llm)" },
+  reliability: { label: "Reliability", cls: "pill-reliability", Icon: ShieldAlert, color: "var(--bad)" },
 };
 
-/* ============================================================
-   SMALL UI ATOMS
-   ============================================================ */
+async function apiRequest(path, options = {}) {
+  const response = await fetch(`${API_ROOT}${path}`, {
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    ...options,
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+
+  if (!response.ok) {
+    const detail = typeof payload === "string" ? payload : payload.detail || "Request failed";
+    throw new Error(detail);
+  }
+
+  return payload;
+}
+
+function fmtNum(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+  return Math.round(n).toString();
+}
+
+function fmtMoney(n) {
+  return "$" + Math.round(n).toLocaleString("en-US");
+}
+
+function clamp(v, min, max) {
+  return Math.min(max, Math.max(min, v));
+}
 
 function MiniTrend({ data, color }) {
   return (
@@ -290,39 +85,67 @@ function StatTile({ label, value, unit, color, series }) {
   );
 }
 
-/* ============================================================
-   MAIN COMPONENT
-   ============================================================ */
-
 export default function InfraAgentPlatform() {
   const [stage, setStage] = useState("intake");
   const [inputText, setInputText] = useState("");
   const [req, setReq] = useState(null);
   const [plans, setPlans] = useState(null);
+  const [projectId, setProjectId] = useState(null);
   const [reasoningLines, setReasoningLines] = useState([]);
   const [revealCount, setRevealCount] = useState(0);
   const [activeView, setActiveView] = useState("describe");
   const [isDeployed, setIsDeployed] = useState(false);
+  const [deploymentId, setDeploymentId] = useState(null);
   const [selectedPlan, setSelectedPlan] = useState(null);
   const [monitor, setMonitor] = useState(null);
+  const [burn, setBurn] = useState(null);
+  const [recommendations, setRecommendations] = useState([]);
   const [dismissed, setDismissed] = useState([]);
   const [exportTab, setExportTab] = useState("terraform");
+  const [exportsState, setExportsState] = useState({ terraform: "", docker: "" });
   const [copied, setCopied] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
 
-  const handleAnalyze = useCallback(() => {
+  const syncDeploymentState = useCallback((payload, resetDismissed = false) => {
+    setDeploymentId(payload.deploymentId);
+    setSelectedPlan(payload.selectedPlan);
+    setMonitor(payload.monitor);
+    setBurn(payload.burn);
+    setRecommendations(payload.recommendations || []);
+    setExportsState(payload.exports || { terraform: "", docker: "" });
+    setIsDeployed(true);
+    if (resetDismissed) setDismissed([]);
+  }, []);
+
+  const handleAnalyze = useCallback(async () => {
     const text = inputText.trim() || EXAMPLES[0];
-    const parsed = parseRequirements(text);
-    setReq(parsed);
-    setReasoningLines(buildReasoningTrace(parsed));
-    setRevealCount(0);
+    setError("");
+    setPending(true);
     setStage("analyzing");
+    setRevealCount(0);
+
+    try {
+      const result = await apiRequest("/analyze", {
+        method: "POST",
+        body: JSON.stringify({ requirement: text }),
+      });
+      setProjectId(result.projectId);
+      setReq(result.requirement);
+      setPlans(result.plans);
+      setReasoningLines(result.reasoningLines);
+    } catch (err) {
+      setStage("intake");
+      setError(err.message);
+    } finally {
+      setPending(false);
+    }
   }, [inputText]);
 
   useEffect(() => {
-    if (stage !== "analyzing") return;
+    if (stage !== "analyzing" || reasoningLines.length === 0) return;
     if (revealCount >= reasoningLines.length) {
       const t = setTimeout(() => {
-        setPlans(estimateStack(req));
         setStage("plan");
         setActiveView("plan");
       }, 550);
@@ -330,75 +153,70 @@ export default function InfraAgentPlatform() {
     }
     const t = setTimeout(() => setRevealCount((c) => c + 1), 460);
     return () => clearTimeout(t);
-  }, [stage, revealCount, reasoningLines, req]);
+  }, [stage, revealCount, reasoningLines]);
 
-  const handleDeploy = useCallback((plan) => {
-    const llmHistory = buildHistory(plan.dailyLlmCalls * (plan.avgPromptTokens + plan.avgCompletionTokens), 0.20, 14);
-    const apiHistory = buildHistory(plan.dailyApiCalls, 0.06, 14);
-    const llmBudget = Math.round((plan.dailyLlmCalls * (plan.avgPromptTokens + plan.avgCompletionTokens) * 30 * 1.06) / 1000) * 1000;
-    const apiBudget = Math.round(plan.dailyApiCalls * 30 * 1.10);
-    const promptShare = clamp(plan.avgPromptTokens / (plan.avgPromptTokens + plan.avgCompletionTokens) + (Math.random() * 0.05 - 0.025), 0.5, 0.92);
-
-    setSelectedPlan(plan);
-    setMonitor({
-      llmHistory, apiHistory, llmBudget, apiBudget, promptShare,
-      liveTicks: {
-        cpu: seedSeries(42, { min: 8, max: 92, step: 5 }),
-        mem: seedSeries(51, { min: 10, max: 90, step: 4 }),
-        gpu: plan.needsGpu ? seedSeries(11, { min: 0, max: 95, step: 3 }) : null,
-        latency: seedSeries(plan.estimatedLatencyMs, { min: plan.estimatedLatencyMs * 0.55, max: plan.estimatedLatencyMs * 1.9, step: plan.estimatedLatencyMs * 0.05 }),
-        error: seedSeries(0.8, { min: 0, max: 15, step: 0.5, spikeChance: 0.05 }),
-      },
-    });
-    setDismissed([]);
-    setIsDeployed(true);
-    setActiveView("console");
-  }, []);
+  const handleDeploy = useCallback(async (plan) => {
+    if (!projectId) return;
+    setPending(true);
+    setError("");
+    try {
+      const result = await apiRequest(`/projects/${projectId}/deploy`, {
+        method: "POST",
+        body: JSON.stringify({ planKey: plan.key }),
+      });
+      syncDeploymentState(result, true);
+      setActiveView("console");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPending(false);
+    }
+  }, [projectId, syncDeploymentState]);
 
   useEffect(() => {
-    if (!isDeployed) return;
-    const id = setInterval(() => {
-      setMonitor((m) => {
-        if (!m) return m;
-        const t = m.liveTicks;
-        return {
-          ...m,
-          liveTicks: {
-            cpu: walk(t.cpu, { min: 8, max: 92, step: 5 }),
-            mem: walk(t.mem, { min: 10, max: 90, step: 4 }),
-            gpu: t.gpu ? walk(t.gpu, { min: 0, max: 95, step: 3 }) : null,
-            latency: walk(t.latency, { min: selectedPlan.estimatedLatencyMs * 0.55, max: selectedPlan.estimatedLatencyMs * 1.9, step: selectedPlan.estimatedLatencyMs * 0.05 }),
-            error: walk(t.error, { min: 0, max: 15, step: 0.5, spikeChance: 0.05 }),
-          },
-        };
-      });
-    }, 2000);
-    return () => clearInterval(id);
-  }, [isDeployed, selectedPlan]);
+    if (!deploymentId) return;
 
-  const liveAvg = useMemo(() => {
-    if (!monitor) return { cpu: 0, mem: 0, gpu: 0, error: 0, latency: 0 };
-    const t = monitor.liveTicks;
-    return {
-      cpu: avgSeries(t.cpu), mem: avgSeries(t.mem),
-      gpu: t.gpu ? avgSeries(t.gpu) : 0,
-      error: avgSeries(t.error), latency: avgSeries(t.latency),
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const result = await apiRequest(`/deployments/${deploymentId}`);
+        if (!cancelled) syncDeploymentState(result, false);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      }
     };
-  }, [monitor]);
 
-  const llmBurn = useMemo(() => monitor ? buildBurnChartData(monitor.llmHistory, monitor.llmBudget) : null, [monitor]);
-  const apiBurn = useMemo(() => monitor ? buildBurnChartData(monitor.apiHistory, monitor.apiBudget) : null, [monitor]);
+    const id = setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [deploymentId, syncDeploymentState]);
 
-  const recommendations = useMemo(() => {
-    if (!monitor || !selectedPlan || !llmBurn || !apiBurn) return [];
-    return buildRecommendations({ plan: selectedPlan, llm: llmBurn, api: apiBurn, liveAvg, promptShare: monitor.promptShare })
-      .filter((r) => !dismissed.includes(r.id));
-  }, [monitor, selectedPlan, llmBurn, apiBurn, liveAvg, dismissed]);
+  const visibleRecommendations = useMemo(
+    () => recommendations.filter((rec) => !dismissed.includes(rec.id)),
+    [recommendations, dismissed],
+  );
 
   const handleReset = useCallback(() => {
-    setStage("intake"); setInputText(""); setReq(null); setPlans(null);
-    setReasoningLines([]); setRevealCount(0); setActiveView("describe");
-    setIsDeployed(false); setSelectedPlan(null); setMonitor(null); setDismissed([]);
+    setStage("intake");
+    setInputText("");
+    setReq(null);
+    setPlans(null);
+    setProjectId(null);
+    setReasoningLines([]);
+    setRevealCount(0);
+    setActiveView("describe");
+    setIsDeployed(false);
+    setDeploymentId(null);
+    setSelectedPlan(null);
+    setMonitor(null);
+    setBurn(null);
+    setRecommendations([]);
+    setDismissed([]);
+    setExportsState({ terraform: "", docker: "" });
+    setError("");
+    setPending(false);
   }, []);
 
   const handleCopy = useCallback((text) => {
@@ -406,7 +224,9 @@ export default function InfraAgentPlatform() {
       navigator.clipboard.writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch (e) { /* clipboard unavailable — ignore */ }
+    } catch (e) {
+      // ignore clipboard errors in unsupported contexts
+    }
   }, []);
 
   const railItems = [
@@ -416,6 +236,11 @@ export default function InfraAgentPlatform() {
     { id: "optimize", num: "04", label: "Optimize", Icon: Sparkles, locked: !isDeployed },
     { id: "export", num: "05", label: "Export", Icon: Download, locked: !isDeployed },
   ];
+
+  const llmBurn = burn?.llm;
+  const apiBurn = burn?.api;
+  const liveTicks = monitor?.liveTicks;
+  const liveAverages = monitor?.liveAverages || { cpu: 0, mem: 0, gpu: 0, error: 0, latency: 0 };
 
   return (
     <div className="app-shell">
@@ -465,9 +290,10 @@ export default function InfraAgentPlatform() {
         @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(79,191,131,0.45); } 70% { box-shadow: 0 0 0 6px rgba(79,191,131,0); } 100% { box-shadow: 0 0 0 0 rgba(79,191,131,0); } }
 
         .btn-primary { background: var(--text); color: var(--bg); border: none; border-radius: 9px; padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-family: inherit; }
-        .btn-primary:hover { opacity: 0.9; }
+        .btn-primary:hover:not(:disabled) { opacity: 0.9; }
+        .btn-primary:disabled, .btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); border-radius: 9px; padding: 9px 14px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-family: inherit; }
-        .btn-ghost:hover { color: var(--text); border-color: var(--text-dim); }
+        .btn-ghost:hover:not(:disabled) { color: var(--text); border-color: var(--text-dim); }
 
         .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
         .panel-title { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
@@ -489,8 +315,8 @@ export default function InfraAgentPlatform() {
         .plan-card.recommended { border-color: var(--accent-llm); }
         .badge-rec { font-size: 10.5px; font-weight: 600; color: var(--accent-llm); background: rgba(181,131,240,0.12); border: 1px solid rgba(181,131,240,0.35); border-radius: 6px; padding: 2px 7px; letter-spacing: 0.03em; }
 
-        .row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; padding: 5px 0; color: var(--text-muted); }
-        .row strong { color: var(--text); font-family: 'IBM Plex Mono', monospace; font-weight: 500; }
+        .row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; padding: 5px 0; color: var(--text-muted); gap: 12px; }
+        .row strong { color: var(--text); font-family: 'IBM Plex Mono', monospace; font-weight: 500; text-align: right; }
         .divider { border-top: 1px solid var(--border); margin: 10px 0; }
 
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; }
@@ -515,13 +341,13 @@ export default function InfraAgentPlatform() {
         .tab-toggle button { background: transparent; border: none; color: var(--text-muted); padding: 8px 16px; font-size: 12.5px; cursor: pointer; font-family: inherit; }
         .tab-toggle button.active { background: var(--panel-alt); color: var(--text); }
 
-        .code-block { background: #10121600; background: var(--panel-alt); border: 1px solid var(--border); border-radius: 10px; padding: 16px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.65; color: #C7CBD6; overflow-x: auto; white-space: pre; }
+        .code-block { background: var(--panel-alt); border: 1px solid var(--border); border-radius: 10px; padding: 16px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.65; color: #C7CBD6; overflow-x: auto; white-space: pre; }
+        .banner-error { margin-top: 14px; color: #FFD6D4; border-color: rgba(232,86,79,0.45); background: rgba(232,86,79,0.08); }
 
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
       `}</style>
 
-      {/* RAIL */}
       <nav className="rail">
         <div className="rail-brand" />
         {railItems.map((item) => (
@@ -539,17 +365,16 @@ export default function InfraAgentPlatform() {
         ))}
       </nav>
 
-      {/* MAIN */}
       <div className="main">
         <div className="topbar">
           <div>
             <div className="display" style={{ fontWeight: 700, fontSize: 15 }}>LEDGER</div>
-            <div className="label-sm" style={{ marginTop: 1 }}>Infra, priced and watched</div>
+            <div className="label-sm" style={{ marginTop: 1 }}>Infrastructure planning and monitoring</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
             <div className="status-pill">
               <span className={`status-dot ${isDeployed ? "live" : ""}`} />
-              {isDeployed ? "Sandbox: live" : "Sandbox: idle"}
+              {isDeployed ? "Backend: live deployment" : "Backend: idle"}
             </div>
             {stage !== "intake" && (
               <button className="btn-ghost" onClick={handleReset}>
@@ -560,12 +385,11 @@ export default function InfraAgentPlatform() {
         </div>
 
         <div className="content">
-          {/* ---------------- DESCRIBE ---------------- */}
           {activeView === "describe" && (
             <div style={{ maxWidth: 640 }}>
               <h2 className="display" style={{ fontSize: 24, margin: "0 0 6px" }}>Describe what you're building</h2>
               <p style={{ color: "var(--text-muted)", fontSize: 14, margin: "0 0 20px" }}>
-                Plain language in. A sized, priced infrastructure plan out.
+                React sends plain language to a Python service that sizes, prices, and monitors the stack.
               </p>
 
               {stage === "intake" && (
@@ -581,7 +405,7 @@ export default function InfraAgentPlatform() {
                       <button key={i} className="chip" onClick={() => setInputText(ex)}>{ex}</button>
                     ))}
                   </div>
-                  <button className="btn-primary" onClick={handleAnalyze}>
+                  <button className="btn-primary" onClick={handleAnalyze} disabled={pending}>
                     Design infrastructure <ArrowRight size={14} />
                   </button>
                 </>
@@ -589,14 +413,19 @@ export default function InfraAgentPlatform() {
 
               {stage === "analyzing" && (
                 <div className="panel" style={{ minHeight: 180 }}>
-                  <div className="label-sm" style={{ marginBottom: 12 }}>Agent is reasoning</div>
+                  <div className="label-sm" style={{ marginBottom: 12 }}>Python planner is reasoning</div>
+                  {reasoningLines.length === 0 && (
+                    <div style={{ color: "var(--text-muted)", fontSize: 13 }}>
+                      Waiting for backend response{pending ? "..." : "."}
+                    </div>
+                  )}
                   {reasoningLines.slice(0, revealCount).map((line, i) => (
                     <div key={i} className="reasoning-line">
                       <ChevronRight size={13} style={{ marginTop: 2, flexShrink: 0 }} />
                       <span>{line}</span>
                     </div>
                   ))}
-                  {revealCount < reasoningLines.length && <span className="cursor" />}
+                  {reasoningLines.length > 0 && revealCount < reasoningLines.length && <span className="cursor" />}
                 </div>
               )}
 
@@ -605,10 +434,11 @@ export default function InfraAgentPlatform() {
                   <Check size={16} /> Plan ready — open the <strong style={{ color: "var(--text)" }}>Plan</strong> tab.
                 </div>
               )}
+
+              {error && <div className="panel banner-error">{error}</div>}
             </div>
           )}
 
-          {/* ---------------- PLAN ---------------- */}
           {activeView === "plan" && plans && req && (
             <div>
               <h2 className="display" style={{ fontSize: 24, margin: "0 0 6px" }}>Two ways to build this</h2>
@@ -641,38 +471,45 @@ export default function InfraAgentPlatform() {
                     <div className="divider" />
                     <p style={{ fontSize: 12.5, color: "var(--text-muted)", margin: "0 0 14px", lineHeight: 1.5 }}>{plan.tradeoff}</p>
 
-                    <button className="btn-primary" style={{ width: "100%", justifyContent: "center" }} onClick={() => handleDeploy(plan)}>
-                      <Rocket size={14} /> Deploy to sandbox
+                    <button className="btn-primary" style={{ width: "100%", justifyContent: "center" }} onClick={() => handleDeploy(plan)} disabled={pending}>
+                      <Rocket size={14} /> Deploy to backend sandbox
                     </button>
                   </div>
                 ))}
               </div>
+              {error && <div className="panel banner-error" style={{ marginTop: 16 }}>{error}</div>}
             </div>
           )}
 
-          {/* ---------------- CONSOLE ---------------- */}
-          {activeView === "console" && (!isDeployed ? (
+          {activeView === "console" && (!isDeployed || !selectedPlan || !monitor || !llmBurn || !apiBurn ? (
             <LockedState onGoPlan={() => setActiveView(plans ? "plan" : "describe")} label="Deploy a plan first to open the console." />
           ) : (
             <div>
               <h2 className="display" style={{ fontSize: 24, margin: "0 0 6px" }}>Live console</h2>
               <p style={{ color: "var(--text-muted)", fontSize: 14, margin: "0 0 20px" }}>
-                {selectedPlan.name} · deployed to sandbox
+                {selectedPlan.name} · deployment {deploymentId}
               </p>
 
               <div className="stats-grid" style={{ marginBottom: 16 }}>
-                <StatTile label="CPU" value={liveAvg.cpu.toFixed(0)} unit="%" color="var(--accent-compute)" series={monitor.liveTicks.cpu} />
-                <StatTile label="Memory" value={liveAvg.mem.toFixed(0)} unit="%" color="var(--accent-compute)" series={monitor.liveTicks.mem} />
+                <StatTile label="CPU" value={liveAverages.cpu.toFixed(0)} unit="%" color="var(--accent-compute)" series={liveTicks.cpu} />
+                <StatTile label="Memory" value={liveAverages.mem.toFixed(0)} unit="%" color="var(--accent-compute)" series={liveTicks.mem} />
                 {selectedPlan.needsGpu && (
-                  <StatTile label="GPU" value={liveAvg.gpu.toFixed(0)} unit="%" color="var(--accent-compute)" series={monitor.liveTicks.gpu} />
+                  <StatTile label="GPU" value={liveAverages.gpu.toFixed(0)} unit="%" color="var(--accent-compute)" series={liveTicks.gpu} />
                 )}
-                <StatTile label="Latency p95" value={Math.round(monitor.liveTicks.latency[monitor.liveTicks.latency.length - 1].v)} unit="ms" color="var(--accent-compute)" series={monitor.liveTicks.latency} />
-                <StatTile label="Error rate" value={liveAvg.error.toFixed(1)} unit="%" color={liveAvg.error > 2.2 ? "var(--bad)" : "var(--good)"} series={monitor.liveTicks.error} />
+                <StatTile label="Latency p95" value={Math.round(liveTicks.latency[liveTicks.latency.length - 1].v)} unit="ms" color="var(--accent-compute)" series={liveTicks.latency} />
+                <StatTile label="Error rate" value={liveAverages.error.toFixed(1)} unit="%" color={liveAverages.error > 2.2 ? "var(--bad)" : "var(--good)"} series={liveTicks.error} />
               </div>
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px,1fr))", gap: 16, marginBottom: 16 }}>
-                <BudgetPanel title="API tokens" color="var(--accent-api)" burn={apiBurn} budget={monitor.apiBudget} unit="calls" />
-                <BudgetPanel title="LLM tokens" color="var(--accent-llm)" burn={llmBurn} budget={monitor.llmBudget} unit="tokens" extra={`Prompt/completion split ${Math.round(monitor.promptShare * 100)}% / ${Math.round((1 - monitor.promptShare) * 100)}%`} />
+                <BudgetPanel title="API tokens" color="var(--accent-api)" burn={apiBurn} budget={monitor.apiBudget} unit="calls" additionalInfo={`Current daily burn ${fmtNum(apiBurn.currentDaily)} calls`} />
+                <BudgetPanel
+                  title="LLM tokens"
+                  color="var(--accent-llm)"
+                  burn={llmBurn}
+                  budget={monitor.llmBudget}
+                  unit="tokens"
+                  additionalInfo={`Prompt/completion ${monitor.promptTokensPerRequest} / ${monitor.completionTokensPerRequest} tokens per request`}
+                />
               </div>
 
               <div className="panel">
@@ -694,25 +531,25 @@ export default function InfraAgentPlatform() {
                   </LineChart>
                 </ResponsiveContainer>
               </div>
+              {error && <div className="panel banner-error" style={{ marginTop: 16 }}>{error}</div>}
             </div>
           ))}
 
-          {/* ---------------- OPTIMIZE ---------------- */}
           {activeView === "optimize" && (!isDeployed ? (
             <LockedState onGoPlan={() => setActiveView(plans ? "plan" : "describe")} label="Deploy a plan first to generate recommendations." />
           ) : (
             <div>
               <h2 className="display" style={{ fontSize: 24, margin: "0 0 6px" }}>Recommendations</h2>
               <p style={{ color: "var(--text-muted)", fontSize: 14, margin: "0 0 20px" }}>
-                Generated from what the console is observing right now — not fixed rules.
+                Generated server-side from persisted budgets, metrics, and token history.
               </p>
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                {recommendations.map((rec) => {
+                {visibleRecommendations.map((rec) => {
                   const meta = CATEGORY_META[rec.category];
                   return (
                     <div key={rec.id} className="panel rec-card">
                       <div className="rec-icon" style={{ background: `var(--panel-alt)` }}>
-                        <meta.Icon size={16} className={meta.cls} style={{ color: `var(--accent-${rec.category === "reliability" ? "" : rec.category})` }} />
+                        <meta.Icon size={16} style={{ color: meta.color }} />
                       </div>
                       <div style={{ flex: 1 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
@@ -738,26 +575,25 @@ export default function InfraAgentPlatform() {
             </div>
           ))}
 
-          {/* ---------------- EXPORT ---------------- */}
           {activeView === "export" && (!isDeployed ? (
             <LockedState onGoPlan={() => setActiveView(plans ? "plan" : "describe")} label="Deploy a plan first to export its configuration." />
           ) : (
             <div>
               <h2 className="display" style={{ fontSize: 24, margin: "0 0 6px" }}>Export the stack</h2>
               <p style={{ color: "var(--text-muted)", fontSize: 14, margin: "0 0 18px" }}>
-                Generated from the {selectedPlan.name} plan.
+                Generated by the Python backend from the selected persisted plan.
               </p>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                 <div className="tab-toggle">
                   <button className={exportTab === "terraform" ? "active" : ""} onClick={() => setExportTab("terraform")}>Terraform</button>
                   <button className={exportTab === "docker" ? "active" : ""} onClick={() => setExportTab("docker")}>Dockerfile</button>
                 </div>
-                <button className="btn-ghost" onClick={() => handleCopy(exportTab === "terraform" ? terraformSnippet(selectedPlan) : dockerSnippet(selectedPlan))}>
+                <button className="btn-ghost" onClick={() => handleCopy(exportTab === "terraform" ? exportsState.terraform : exportsState.docker)}>
                   {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? "Copied" : "Copy"}
                 </button>
               </div>
               <div className="code-block">
-                {exportTab === "terraform" ? terraformSnippet(selectedPlan) : dockerSnippet(selectedPlan)}
+                {exportTab === "terraform" ? exportsState.terraform : exportsState.docker}
               </div>
             </div>
           ))}
@@ -779,7 +615,7 @@ function LockedState({ label, onGoPlan }) {
   );
 }
 
-function BudgetPanel({ title, color, burn, budget, unit, extra }) {
+function BudgetPanel({ title, color, burn, budget, unit, additionalInfo }) {
   return (
     <div className="panel">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
@@ -793,62 +629,7 @@ function BudgetPanel({ title, color, burn, budget, unit, extra }) {
           {burn.overrunWithinCycle ? `Runway: ${burn.daysUntilOverrun}d` : "On budget"}
         </span>
       </div>
-      {extra && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 8 }}>{extra}</div>}
+      {additionalInfo && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 8 }}>{additionalInfo}</div>}
     </div>
   );
-}
-
-function terraformSnippet(plan) {
-  return `# Generated by Ledger — ${plan.name} plan
-resource "aws_ecs_cluster" "app" {
-  name = "app-${plan.key}-cluster"
-}
-
-resource "aws_ecs_service" "inference" {
-  name            = "inference-service"
-  cluster         = aws_ecs_cluster.app.id
-  desired_count   = ${Math.max(2, Math.round(plan.concurrency / 40))}
-  launch_type     = "${plan.needsGpu ? "EC2" : "FARGATE"}"
-}
-
-resource "aws_appautoscaling_target" "inference" {
-  max_capacity       = ${Math.max(4, Math.round(plan.concurrency / 22))}
-  min_capacity       = ${Math.max(2, Math.round(plan.concurrency / 60))}
-  resource_id        = "service/app-${plan.key}-cluster/inference-service"
-  scalable_dimension = "ecs:service:DesiredCount"
-  service_namespace  = "ecs"
-}
-${plan.needsVectorDb ? `
-resource "aws_opensearch_domain" "vectors" {
-  domain_name    = "vector-index-${plan.key}"
-  engine_version = "OpenSearch_2.11"
-}` : ""}
-
-variable "llm_monthly_token_budget" {
-  default = ${plan.dailyLlmCalls * (plan.avgPromptTokens + plan.avgCompletionTokens) * 30}
-}
-
-variable "api_monthly_call_budget" {
-  default = ${plan.dailyApiCalls * 30}
-}
-`;
-}
-
-function dockerSnippet(plan) {
-  return `# Generated by Ledger — ${plan.name} plan
-FROM ${plan.needsGpu ? "nvidia/cuda:12.2.0-runtime-ubuntu22.04" : "python:3.11-slim"}
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-ENV LLM_MONTHLY_TOKEN_BUDGET=${plan.dailyLlmCalls * (plan.avgPromptTokens + plan.avgCompletionTokens) * 30}
-ENV API_MONTHLY_CALL_BUDGET=${plan.dailyApiCalls * 30}
-ENV TARGET_LATENCY_MS=${plan.estimatedLatencyMs}
-
-EXPOSE 8080
-CMD ["python", "serve.py"]
-`;
 }
