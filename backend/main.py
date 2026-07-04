@@ -655,8 +655,8 @@ def docker_snippet(plan: dict[str, Any]) -> str:
 FROM {"nvidia/cuda:12.2.0-runtime-ubuntu22.04" if plan['needsGpu'] else "python:3.11-slim"}
 
 WORKDIR /app
-COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+COPY backend/requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 

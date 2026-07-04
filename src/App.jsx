@@ -369,7 +369,7 @@ export default function InfraAgentPlatform() {
         <div className="topbar">
           <div>
             <div className="display" style={{ fontWeight: 700, fontSize: 15 }}>LEDGER</div>
-            <div className="label-sm" style={{ marginTop: 1 }}>React UI over a Python planning service</div>
+            <div className="label-sm" style={{ marginTop: 1 }}>Infrastructure planning and monitoring</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
             <div className="status-pill">
@@ -501,14 +501,14 @@ export default function InfraAgentPlatform() {
               </div>
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px,1fr))", gap: 16, marginBottom: 16 }}>
-                <BudgetPanel title="API tokens" color="var(--accent-api)" burn={apiBurn} budget={monitor.apiBudget} unit="calls" extra={`Current daily burn ${fmtNum(apiBurn.currentDaily)} calls`} />
+                <BudgetPanel title="API tokens" color="var(--accent-api)" burn={apiBurn} budget={monitor.apiBudget} unit="calls" additionalInfo={`Current daily burn ${fmtNum(apiBurn.currentDaily)} calls`} />
                 <BudgetPanel
                   title="LLM tokens"
                   color="var(--accent-llm)"
                   burn={llmBurn}
                   budget={monitor.llmBudget}
                   unit="tokens"
-                  extra={`Prompt/completion ${monitor.promptTokensPerRequest} / ${monitor.completionTokensPerRequest} tokens per request`}
+                  additionalInfo={`Prompt/completion ${monitor.promptTokensPerRequest} / ${monitor.completionTokensPerRequest} tokens per request`}
                 />
               </div>
 
@@ -615,7 +615,7 @@ function LockedState({ label, onGoPlan }) {
   );
 }
 
-function BudgetPanel({ title, color, burn, budget, unit, extra }) {
+function BudgetPanel({ title, color, burn, budget, unit, additionalInfo }) {
   return (
     <div className="panel">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
@@ -629,7 +629,7 @@ function BudgetPanel({ title, color, burn, budget, unit, extra }) {
           {burn.overrunWithinCycle ? `Runway: ${burn.daysUntilOverrun}d` : "On budget"}
         </span>
       </div>
-      {extra && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 8 }}>{extra}</div>}
+      {additionalInfo && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 8 }}>{additionalInfo}</div>}
     </div>
   );
 }
