@@ -124,7 +124,6 @@ export default function InfraAgentPlatform() {
     setPending(true);
     setStage("analyzing");
     setRevealCount(0);
-    setReasoningLines([]);
 
     try {
       const result = await apiRequest("/analyze", {

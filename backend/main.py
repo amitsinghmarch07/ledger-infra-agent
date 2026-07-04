@@ -234,26 +234,38 @@ def get_deployment(deployment_id: str) -> dict[str, Any]:
 
 def parse_requirements(raw: str) -> dict[str, Any]:
     text = raw.lower()
+    tokens = tokenize(text)
 
     users = 1000.0
-    user_match = re.search(r"([\d]{1,3}(?:,\d{3})*|\d+(?:\.\d+)?)\s*(k)?\s*(?:daily|monthly)?\s*(?:active\s*)?users?", text)
-    if user_match:
-        value = float(user_match.group(1).replace(",", ""))
-        if user_match.group(2):
-            value *= 1000
-        if value > 0:
-            users = value
+    for index, token in enumerate(tokens):
+        if token not in {"user", "users"}:
+            continue
+        for candidate in reversed(tokens[max(0, index - 3):index]):
+            value = parse_count_token(candidate)
+            if value is not None and value > 0:
+                users = value
+                break
+        if users != 1000.0:
+            break
 
     latency_ms = 2000.0
-    sub_match = re.search(r"sub[- ]?(\d+(?:\.\d+)?)\s*s\b", text)
-    ms_match = re.search(r"(\d+)\s*ms\b", text)
-    s_match = re.search(r"(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b", text)
-    if sub_match:
-        latency_ms = float(sub_match.group(1)) * 1000
-    elif ms_match:
-        latency_ms = float(ms_match.group(1))
-    elif s_match:
-        latency_ms = float(s_match.group(1)) * 1000
+    for index, token in enumerate(tokens):
+        if token == "sub" and index + 1 < len(tokens):
+            parsed = parse_duration_ms(tokens[index + 1])
+            if parsed is not None:
+                latency_ms = parsed
+                break
+
+        parsed = parse_duration_ms(token)
+        if parsed is not None:
+            latency_ms = parsed
+            break
+
+        if token in {"ms", "s", "sec", "second", "seconds"} and index > 0:
+            value = parse_count_token(tokens[index - 1])
+            if value is not None:
+                latency_ms = value if token == "ms" else value * 1000
+                break
 
     flags = {
         "rag": bool(re.search(r"\brag\b|retrieval", text)),
@@ -266,7 +278,7 @@ def parse_requirements(raw: str) -> dict[str, Any]:
     if not any(flags.values()):
         flags["chat"] = True
 
-    return {"raw": raw, "users": round(users), "latencyMs": latency_ms, "flags": flags}
+    return {"raw": raw, "users": users, "latencyMs": latency_ms, "flags": flags}
 
 
 def build_reasoning_trace(requirement: dict[str, Any]) -> list[str]:
@@ -643,8 +655,8 @@ def docker_snippet(plan: dict[str, Any]) -> str:
 FROM {"nvidia/cuda:12.2.0-runtime-ubuntu22.04" if plan['needsGpu'] else "python:3.11-slim"}
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY . .
 
@@ -671,3 +683,33 @@ def fmt_money(value: float) -> str:
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return min(maximum, max(minimum, value))
+
+
+def tokenize(text: str) -> list[str]:
+    chars = [ch if ch.isalnum() or ch in {".", ","} else " " for ch in text]
+    return [token.strip(".,") for token in "".join(chars).split() if token.strip(".,")]
+
+
+def parse_count_token(token: str) -> float | None:
+    stripped = token.replace(",", "")
+    multiplier = 1.0
+    if stripped.endswith("k"):
+        stripped = stripped[:-1]
+        multiplier = 1000.0
+    if not stripped:
+        return None
+    if stripped.count(".") > 1:
+        return None
+    if not stripped.replace(".", "", 1).isdigit():
+        return None
+    return float(stripped) * multiplier
+
+
+def parse_duration_ms(token: str) -> float | None:
+    if token.endswith("ms"):
+        value = parse_count_token(token[:-2])
+        return value
+    if token.endswith("s"):
+        value = parse_count_token(token[:-1])
+        return value * 1000 if value is not None else None
+    return None
